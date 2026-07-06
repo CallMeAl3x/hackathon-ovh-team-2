@@ -1,0 +1,20 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: vulnerable-app
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/CallMeAl3x/hackathon-ovh-team-2.git
+    targetRevision: main
+    path: apps/vulnerable-app
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: demo
+  syncPolicy:
+    automated:
+      prune: true      # supprime ce qui a disparu de Git
+      selfHeal: true   # répare le drift manuel
+    syncOptions:
+      - CreateNamespace=true
