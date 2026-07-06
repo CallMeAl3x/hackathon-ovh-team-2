@@ -13,7 +13,7 @@ spec:
     spec:
       containers:
         - name: web
-          image: nginxinc/nginx-unprivileged:1.23
+          image: nginxinc/nginx-unprivileged:1.29
           securityContext:
             runAsUser: 101
             runAsGroup: 101
