@@ -2,133 +2,73 @@
 Remédiateur IA — Hackathon OVHcloud x Ynov
 Boucle : rapports Trivy -> analyse IA -> Pull Request GitHub
 """
-import os
-import re
-import yaml
-from kubernetes import client, config
-from openai import OpenAI
-from github import Github
+import argparse
+import logging
 
-# ---------- 1. Lire les rapports Trivy dans le cluster ----------
+from ai_client import AIResponseError, ask_ai_for_fix
+from config import ConfigurationError, RemediatorConfig, read_config
+from git_workflow import (
+    GitWorkflowError,
+    build_remediation_branch_name,
+    build_virtual_diff,
+    commit_manifest,
+    create_branch_from_ref,
+    diff_manifest,
+    ensure_clean_worktree,
+    ensure_only_expected_changes,
+    fetch_base_branch,
+    push_branch,
+    read_file_from_ref,
+    stage_manifest,
+    target_ref,
+    write_manifest,
+)
+from trivy_client import TrivyReportError, get_vulnerability_reports, summarize_report
+from validators import ManifestValidationError, validate_fixed_manifest
 
-def get_vulnerability_reports(namespace: str = "demo") -> list[dict]:
-    """Récupère les VulnerabilityReports (CRD de trivy-operator)."""
-    config.load_kube_config()  # utilise ~/.kube/config
-    api = client.CustomObjectsApi()
-    reports = api.list_namespaced_custom_object(
-        group="aquasecurity.github.io",
-        version="v1alpha1",
-        namespace=namespace,
-        plural="vulnerabilityreports",
+
+LOG = logging.getLogger("remediator")
+
+
+def setup_logging() -> None:
+    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Remediate a Trivy finding with OVHcloud AI Endpoints and a GitHub PR."
     )
-    return reports["items"]
-
-
-def summarize_report(report: dict, max_cves: int = 15) -> str:
-    """Résume un rapport en texte compact pour le prompt (on ne garde que l'essentiel)."""
-    vulns = report["report"]["vulnerabilities"]
-    # Tri : les plus graves d'abord
-    order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-    vulns.sort(key=lambda v: order.get(v["severity"], 9))
-    lines = [
-        f"Workload: {report['metadata']['labels'].get('trivy-operator.resource.name', '?')}",
-        f"Image scannee: {report['report']['artifact']['repository']}:"
-        f"{report['report']['artifact'].get('tag', '?')}",
-        f"Total: {len(vulns)} vulnerabilites.",
-        "Principales CVE (severite, paquet, version installee -> version corrigee):",
-    ]
-    for v in vulns[:max_cves]:
-        lines.append(
-            f"- {v['vulnerabilityID']} [{v['severity']}] {v['resource']} "
-            f"{v.get('installedVersion', '?')} -> fix: {v.get('fixedVersion', 'n/a')}"
-        )
-    return "\n".join(lines)
-
-
-# ---------- 2. Lire le manifest actuel depuis GitHub ----------
-
-MANIFEST_PATH = "apps/vulnerable-app/deployment.yaml"
-
-
-def get_manifest_from_github(gh_repo) -> tuple[str, str]:
-    f = gh_repo.get_contents(MANIFEST_PATH, ref="main")
-    return f.decoded_content.decode(), f.sha
-
-
-# ---------- 3. Demander le correctif à l'IA ----------
-
-SYSTEM_PROMPT = """Tu es un expert en securite Kubernetes.
-On te donne : (1) un resume de vulnerabilites detectees par Trivy,
-(2) le manifest YAML actuel du workload concerne.
-Ta mission :
-- Proposer le manifest YAML CORRIGE : mets a jour l'image vers une version
-  recente corrigeant les CVE, supprime privileged, fais tourner le conteneur
-  en utilisateur non-root, ajoute des requests/limits CPU et memoire raisonnables.
-- Le YAML doit rester un Deployment valide et minimal (memes noms, memes labels).
-Reponds STRICTEMENT dans ce format :
-EXPLICATION:
-<3 a 6 lignes en francais expliquant chaque correction>
-YAML:
-```yaml
-<le manifest complet corrige>
-```"""
-
-
-def ask_ai_for_fix(ai: OpenAI, report_summary: str, current_manifest: str) -> tuple[str, str]:
-    resp = ai.chat.completions.create(
-        model=os.environ["OVH_AI_MODEL"],
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content":
-                f"RAPPORT TRIVY:\n{report_summary}\n\nMANIFEST ACTUEL:\n{current_manifest}"},
-        ],
-        temperature=0.2,   # peu de creativite : on veut du YAML fiable
-        max_tokens=2000,
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate the AI remediation and show the diff without branch, commit, push or PR",
     )
-    text = resp.choices[0].message.content
-    # Extraction robuste des deux blocs
-    explanation = text.split("EXPLICATION:")[1].split("YAML:")[0].strip()
-    match = re.search(r"```yaml\n(.*?)```", text, re.DOTALL)
-    if not match:
-        raise ValueError(f"L'IA n'a pas renvoye de bloc YAML :\n{text}")
-    fixed_yaml = match.group(1).strip() + "\n"
-    yaml.safe_load(fixed_yaml)  # garde-fou : le YAML doit au moins etre parsable
-    return explanation, fixed_yaml
+    return parser.parse_args()
 
 
-# ---------- 4 & 5. Brancher, committer, ouvrir la PR ----------
+# ---------- Pull Request GitHub ----------
 
-def open_pull_request(gh_repo, file_sha: str, fixed_yaml: str,
-                      explanation: str, report_summary: str) -> str:
-    main = gh_repo.get_branch("main")
-    branch = "fix/ai-remediation"
-
-    # Évite les PR en double : si une PR de remédiation est déjà ouverte, on s'arrête
-    for pr in gh_repo.get_pulls(state="open", head=f"{gh_repo.owner.login}:{branch}"):
-        print(f"Une PR de remédiation est déjà ouverte : {pr.html_url}")
+def create_pull_request(gh_repo, cfg: RemediatorConfig, branch_name: str,
+                        explanation: str, report_summary: str) -> str:
+    for pr in gh_repo.get_pulls(
+        state="open",
+        head=f"{gh_repo.owner.login}:{branch_name}",
+        base=cfg.target_branch,
+    ):
+        LOG.info("Une PR de remédiation est déjà ouverte : %s", pr.html_url)
         return pr.html_url
 
-    # (Re)cree la branche depuis main
-    try:
-        gh_repo.get_git_ref(f"heads/{branch}").delete()
-    except Exception:
-        pass
-    gh_repo.create_git_ref(ref=f"refs/heads/{branch}", sha=main.commit.sha)
-
-    gh_repo.update_file(
-        path=MANIFEST_PATH,
-        message="fix(security): remediation automatique proposee par l'IA",
-        content=fixed_yaml,
-        sha=file_sha,
-        branch=branch,
-    )
     pr = gh_repo.create_pull(
         title="[IA] Remediation automatique des vulnerabilites detectees",
         body=(f"## Correctif propose par l'IA\n\n{explanation}\n\n"
               f"## Rapport Trivy ayant declenche l'analyse\n```\n{report_summary}\n```\n\n"
-              f"*PR generee automatiquement — relecture humaine requise avant merge.*"),
-        head=branch,
-        base="main",
+              "## Validations automatiques\n"
+              "- Reponse IA extraite et controlee\n"
+              "- Manifest YAML valide avant commit\n"
+              "- Diff Git controle avant push\n\n"
+              "*PR generee automatiquement — relecture humaine requise avant merge.*"),
+        head=branch_name,
+        base=cfg.target_branch,
     )
     return pr.html_url
 
@@ -136,26 +76,96 @@ def open_pull_request(gh_repo, file_sha: str, fixed_yaml: str,
 # ---------- Orchestration ----------
 
 def main():
-    ai = OpenAI(base_url=os.environ["OVH_AI_BASE_URL"],
-                api_key=os.environ["OVH_AI_TOKEN"])
-    gh_repo = Github(os.environ["GITHUB_TOKEN"]).get_repo(os.environ["GITHUB_REPO"])
+    setup_logging()
+    args = parse_args()
+    cfg = read_config(require_github=not args.dry_run)
+    LOG.info("Configuration chargee:\n%s", cfg.public_summary())
 
-    reports = get_vulnerability_reports("demo")
+    if args.dry_run:
+        LOG.info("Mode dry-run actif: aucun fichier de travail, commit, push ou PR.")
+    else:
+        ensure_clean_worktree(cfg.repo_root)
+
+    LOG.info("Synchronisation de la branche cible %s depuis origin", cfg.target_branch)
+    fetch_base_branch(cfg.repo_root, cfg.target_branch)
+
+    reports = get_vulnerability_reports(cfg.trivy_namespace)
     if not reports:
-        print("Aucun VulnerabilityReport dans le namespace demo. Trivy a-t-il fini de scanner ?")
+        LOG.info("Aucun VulnerabilityReport dans le namespace %s. Trivy a-t-il fini de scanner ?",
+                 cfg.trivy_namespace)
         return
 
     summary = summarize_report(reports[0])
-    print("=== Rapport resume ===\n" + summary)
+    LOG.info("Rapport resume:\n%s", summary)
 
-    manifest, sha = get_manifest_from_github(gh_repo)
-    print("\n=== Appel a l'IA (AI Endpoints OVHcloud)... ===")
-    explanation, fixed_yaml = ask_ai_for_fix(ai, summary, manifest)
-    print("\n=== Explication de l'IA ===\n" + explanation)
+    base_ref = target_ref(cfg)
+    manifest = read_file_from_ref(
+        cfg.repo_root,
+        base_ref,
+        cfg.manifest_path,
+    )
+    LOG.info("Manifest source lu depuis %s:%s", base_ref, cfg.manifest_path)
 
-    url = open_pull_request(gh_repo, sha, fixed_yaml, explanation, summary)
-    print(f"\n✅ Pull Request ouverte : {url}")
+    LOG.info("Appel a l'IA (AI Endpoints OVHcloud)...")
+    explanation, fixed_yaml = ask_ai_for_fix(cfg, summary, manifest)
+    validated_manifest = validate_fixed_manifest(fixed_yaml, manifest)
+    LOG.info("Explication de l'IA:\n%s", explanation)
+    LOG.info(
+        "Manifest corrige valide: %s/%s",
+        validated_manifest["kind"],
+        validated_manifest["metadata"]["name"],
+    )
+
+    if args.dry_run:
+        diff = build_virtual_diff(cfg.manifest_path, manifest, fixed_yaml)
+        LOG.info("Diff virtuel controle avant commit:\n%s", diff)
+        LOG.info("Dry-run termine: aucun fichier modifie, aucun commit, aucun push, aucune PR.")
+        return
+
+    branch_name = build_remediation_branch_name(cfg.remediation_branch_prefix)
+    LOG.info("Creation de la branche de remediation: %s", branch_name)
+    create_branch_from_ref(cfg.repo_root, branch_name, base_ref)
+
+    write_manifest(cfg.repo_root, cfg.manifest_path, fixed_yaml)
+    diff = diff_manifest(cfg.repo_root, cfg.manifest_path)
+    LOG.info("Diff Git controle avant commit:\n%s", diff)
+
+    ensure_only_expected_changes(cfg.repo_root, cfg.manifest_path)
+    stage_manifest(cfg.repo_root, cfg.manifest_path)
+    ensure_only_expected_changes(cfg.repo_root, cfg.manifest_path)
+    commit_manifest(
+        cfg.repo_root,
+        "fix(security): remediation automatique proposee par l'IA",
+    )
+    push_branch(cfg.repo_root, branch_name)
+
+    from github import Github
+
+    gh_repo = Github(cfg.github_token).get_repo(cfg.github_repo)
+    url = create_pull_request(gh_repo, cfg, branch_name, explanation, summary)
+    LOG.info("Pull Request ouverte : %s", url)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ConfigurationError as exc:
+        setup_logging()
+        LOG.error("%s", exc)
+        raise SystemExit(2) from exc
+    except ManifestValidationError as exc:
+        setup_logging()
+        LOG.error("Manifest IA refuse: %s", exc)
+        raise SystemExit(3) from exc
+    except AIResponseError as exc:
+        setup_logging()
+        LOG.error("Reponse IA invalide: %s", exc)
+        raise SystemExit(4) from exc
+    except TrivyReportError as exc:
+        setup_logging()
+        LOG.error("Rapport Trivy invalide: %s", exc)
+        raise SystemExit(5) from exc
+    except GitWorkflowError as exc:
+        setup_logging()
+        LOG.error("Workflow Git interrompu: %s", exc)
+        raise SystemExit(6) from exc
