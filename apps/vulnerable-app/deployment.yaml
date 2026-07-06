@@ -13,10 +13,7 @@ spec:
     spec:
       containers:
         - name: web
-          image: nginx:1.23.3
-          securityContext:
-            privileged: false
-            runAsUser: 1000
+          image: nginxinc/nginx-unprivileged:1.23.3
           resources:
             requests:
               cpu: "100m"
@@ -25,4 +22,14 @@ spec:
               cpu: "500m"
               memory: "512Mi"
           ports:
-            - containerPort: 80
+            - containerPort: 8080
+          volumeMounts:
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+            - name: nginx-run
+              mountPath: /var/run
+      volumes:
+        - name: nginx-cache
+          emptyDir: {}
+        - name: nginx-run
+          emptyDir: {}
