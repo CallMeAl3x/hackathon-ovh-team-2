@@ -1,0 +1,26 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: falco
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://falcosecurity.github.io/charts
+    chart: falco
+    targetRevision: "*"
+    helm:
+      values: |
+        driver:
+          kind: modern_ebpf     # driver eBPF moderne, adapté aux clusters managés
+        falcosidekick:
+          enabled: true         # exporte les alertes (webhook, Slack, etc.)
+          webui:
+            enabled: true       # petite UI de visualisation des alertes
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: falco
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions:
+      - CreateNamespace=true

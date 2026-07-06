@@ -1,0 +1,27 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: trivy-operator
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://aquasecurity.github.io/helm-charts/
+    chart: trivy-operator
+    targetRevision: "*"          # en hackathon : dernière version
+    helm:
+      values: |
+        trivy:
+          ignoreUnfixed: true    # ne remonte que les CVE ayant un correctif
+        serviceMonitor:
+          enabled: true          # métriques Prometheus (trivy_image_vulnerabilities)
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: trivy-system
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    retry:
+      limit: 10
+      backoff: { duration: 30s, factor: 2, maxDuration: 5m }
+    syncOptions:
+      - CreateNamespace=true
