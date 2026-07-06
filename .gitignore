@@ -2,3 +2,9 @@
 kubeconfig*.yml
 kubeconfig*.yaml
 __pycache__/
+
+# Secrets du hackathon — NE JAMAIS COMMITTER
+archive*/
+*-key.txt
+ai-endpoints-key.txt
+*.kubeconfig
