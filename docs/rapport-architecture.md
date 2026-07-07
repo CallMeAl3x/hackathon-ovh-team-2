@@ -2,6 +2,34 @@
 
 **Hackathon Lille Ynov Campus × OVHcloud — 6 & 7 juillet 2026 — Team 2**
 
+## Situation & problématique
+
+**Situation.** Une équipe plateforme peu nombreuse gère plusieurs clusters et croule
+sous les findings Trivy/Kyverno. Elle veut automatiser la remédiation par IA générative
+pour tenir la charge — mais ne peut pas risquer qu'une IA casse la production.
+
+**Problématique.**
+> Peut-on automatiser la remédiation des vulnérabilités par IA tout en se méfiant de
+> l'IA elle-même — c'est-à-dire en corrigeant automatiquement son correctif s'il casse la prod ?
+
+Le sujet impose une IA qui *propose* un correctif. Notre angle va au-delà : nous traitons
+l'IA comme **faillible**. La question n'est pas « l'IA sait-elle corriger ? » mais
+« que se passe-t-il **quand elle se trompe**, et comment la chaîne l'encaisse ? »
+
+## Notre angle : une boucle qui se méfie de son IA
+
+Lors de la démonstration, l'IA a produit un correctif **sécurisé mais non fonctionnel**
+(image non-root sur un port privilégié → pod en CrashLoopBackOff). Trois garde-fous
+ont empêché tout dégât, et un quatrième est prévu :
+
+1. **Revue humaine** — aucun correctif n'est mergé sans validation d'un humain.
+2. **Rolling update + readiness (Kubernetes)** — le nouveau pod doit être *Ready* avant
+   que l'ancien soit supprimé : le pod cassé n'a jamais coupé le service.
+3. **Auto-correction** — le remédiateur détecte le pod en échec, capture l'erreur runtime
+   et la **renvoie à l'IA**, qui corrige son propre correctif (PR suivante).
+4. **(Évolution)** — un environnement de **pré-prod** où le correctif est validé avant
+   d'être promu, pour couvrir aussi un correctif qui *démarre mais est cassé*.
+
 ## La boucle
 
 > Détection d'une faille → analyse & correctif par l'IA → Pull Request automatique
