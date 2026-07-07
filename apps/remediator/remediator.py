@@ -105,29 +105,45 @@ YAML:
 
 
 def ask_ai_for_fix(ai: OpenAI, report_summary: str, current_manifest: str,
-                   runtime_failure: str | None = None) -> tuple[str, str]:
+                   runtime_failure: str | None = None, max_tries: int = 3) -> tuple[str, str]:
     user_content = f"RAPPORT TRIVY:\n{report_summary}\n\nMANIFEST ACTUEL:\n{current_manifest}"
     if runtime_failure:
         user_content += ("\n\nERREUR D'EXECUTION DU CORRECTIF PRECEDENT "
                          f"(a corriger imperativement):\n{runtime_failure}")
-    resp = ai.chat.completions.create(
-        model=os.environ["OVH_AI_MODEL"],
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-        temperature=0.2,   # peu de creativite : on veut du YAML fiable
-        max_tokens=2000,
-    )
-    text = resp.choices[0].message.content
-    # Extraction robuste des deux blocs
-    explanation = text.split("EXPLICATION:")[1].split("YAML:")[0].strip()
-    match = re.search(r"```yaml\n(.*?)```", text, re.DOTALL)
-    if not match:
-        raise ValueError(f"L'IA n'a pas renvoye de bloc YAML :\n{text}")
-    fixed_yaml = match.group(1).strip() + "\n"
-    yaml.safe_load(fixed_yaml)  # garde-fou : le YAML doit au moins etre parsable
-    return explanation, fixed_yaml
+
+    # Retry : si l'IA renvoie un YAML invalide, on lui renvoie l'erreur et on redemande.
+    # Le cas normal (YAML valide) sort au 1er tour, comportement identique a avant.
+    last_error = None
+    for tentative in range(1, max_tries + 1):
+        content = user_content
+        if last_error:
+            content += ("\n\nTON YAML PRECEDENT ETAIT INVALIDE. Corrige-le et renvoie "
+                        f"un YAML valide. Erreur rencontree :\n{last_error}")
+        resp = ai.chat.completions.create(
+            model=os.environ["OVH_AI_MODEL"],
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": content},
+            ],
+            temperature=0.2,   # peu de creativite : on veut du YAML fiable
+            max_tokens=2000,
+        )
+        text = resp.choices[0].message.content
+        try:
+            explanation = text.split("EXPLICATION:")[1].split("YAML:")[0].strip()
+            match = re.search(r"```yaml\n(.*?)```", text, re.DOTALL)
+            if not match:
+                raise ValueError("aucun bloc YAML dans la reponse")
+            fixed_yaml = match.group(1).strip() + "\n"
+            yaml.safe_load(fixed_yaml)  # garde-fou : le YAML doit etre parsable
+            return explanation, fixed_yaml
+        except Exception as e:
+            last_error = str(e)
+            print(f"  ⚠ tentative {tentative}/{max_tries} : YAML invalide "
+                  f"({last_error}) — on redemande a l'IA")
+
+    raise ValueError(f"L'IA n'a pas produit de YAML valide apres {max_tries} tentatives. "
+                     f"Derniere erreur : {last_error}")
 
 
 # ---------- 4 & 5. Brancher, committer, ouvrir la PR ----------
