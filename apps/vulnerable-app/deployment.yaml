@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
         - name: web
-          image: nginxinc/nginx-unprivileged:1.23
+          image: nginxinc/nginx-unprivileged:1.25
           ports:
             - containerPort: 8080
           resources:
