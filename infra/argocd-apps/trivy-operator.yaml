@@ -15,6 +15,8 @@ spec:
           ignoreUnfixed: true    # ne remonte que les CVE ayant un correctif
         serviceMonitor:
           enabled: true          # métriques Prometheus (trivy_image_vulnerabilities)
+          labels:
+            release: kube-prometheus-stack   # sinon kube-prometheus-stack ignore ce ServiceMonitor
   destination:
     server: https://kubernetes.default.svc
     namespace: trivy-system
