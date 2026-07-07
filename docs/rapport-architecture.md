@@ -2,6 +2,30 @@
 
 **Hackathon Lille Ynov Campus × OVHcloud — 6 & 7 juillet 2026 — Team 2**
 
+## Problématique
+
+Une petite équipe qui gère plusieurs clusters doit traiter beaucoup de vulnérabilités
+remontées par Trivy et Kyverno. Automatiser la correction avec une IA aide à suivre le
+rythme, mais une IA ne doit pas pouvoir modifier la production sans contrôle.
+
+Notre question n'est pas de savoir si l'IA sait corriger une faille (le sujet le demande),
+mais si on peut lui faire confiance, et ce qui se passe quand elle se trompe. On part du
+principe que l'IA peut proposer un mauvais correctif, et on construit la chaîne pour gérer
+ce cas.
+
+C'est ce qui est arrivé pendant nos tests : l'IA a proposé un correctif correct pour la
+sécurité mais qui empêchait le conteneur de démarrer. La production n'a pas été coupée pour
+autant, pour trois raisons :
+
+- le merge est manuel, donc quelqu'un relit avant que ce soit appliqué ;
+- Kubernetes ne supprime l'ancien pod que si le nouveau démarre correctement, donc le pod
+  cassé n'a pas remplacé celui qui marchait ;
+- le remédiateur voit que le pod ne démarre pas, récupère l'erreur et la renvoie à l'IA,
+  qui corrige son correctif dans une nouvelle Pull Request.
+
+Avec plus de temps, l'étape suivante serait un environnement de test où l'on vérifie le
+correctif avant de le mettre en production.
+
 ## La boucle
 
 > Détection d'une faille → analyse & correctif par l'IA → Pull Request automatique
