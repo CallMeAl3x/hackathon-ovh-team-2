@@ -6,24 +6,19 @@ metadata:
 spec:
   replicas: 1
   selector:
-    matchLabels:
-      app: vulnerable-web
+    matchLabels: { app: vulnerable-web }
   template:
     metadata:
-      labels:
-        app: vulnerable-web
+      labels: { app: vulnerable-web }
     spec:
       containers:
         - name: web
-          image: nginxinc/nginx-unprivileged:1.23
-          ports:
-            - containerPort: 8080
-          resources:
-            requests:
-              cpu: "500m"
-              memory: "256Mi"
-            limits:
-              cpu: "500m"
-              memory: "256Mi"
+          # FAILLE 1 : image très ancienne, bourrée de CVE connues
+          image: nginx:1.14
+          # FAILLE 2 : conteneur privilégié = accès quasi-root au node
           securityContext:
-            runAsUser: 101
+            privileged: true
+            runAsUser: 0          # FAILLE 3 : tourne en root
+          # FAILLE 4 : aucune limite CPU/mémoire
+          ports:
+            - containerPort: 80
