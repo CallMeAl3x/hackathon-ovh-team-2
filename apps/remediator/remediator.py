@@ -45,6 +45,30 @@ def summarize_report(report: dict, max_cves: int = 15) -> str:
     return "\n".join(lines)
 
 
+# ---------- 1bis. Détecter un correctif précédent qui casse le workload ----------
+
+def get_runtime_failure(namespace: str = "demo") -> str | None:
+    """Si un pod est en échec (CrashLoopBackOff/Error), renvoie un extrait de logs
+    à donner à l'IA : elle pourra corriger un correctif précédent non fonctionnel.
+    C'est ce qui rend la boucle *auto-corrective* (feedback runtime -> IA)."""
+    core = client.CoreV1Api()
+    for p in core.list_namespaced_pod(namespace).items:
+        for cs in (p.status.container_statuses or []):
+            w = cs.state.waiting
+            if w and w.reason in ("CrashLoopBackOff", "Error",
+                                  "RunContainerError", "CreateContainerError"):
+                name = p.metadata.name
+                try:  # 'previous=True' : logs de l'instance qui a crashé
+                    logs = core.read_namespaced_pod_log(name, namespace, tail_lines=15, previous=True)
+                except Exception:
+                    try:
+                        logs = core.read_namespaced_pod_log(name, namespace, tail_lines=15)
+                    except Exception:
+                        logs = "(logs indisponibles)"
+                return f"Pod {name} en {w.reason}.\nLogs:\n{logs.strip()}"
+    return None
+
+
 # ---------- 2. Lire le manifest actuel depuis GitHub ----------
 
 MANIFEST_PATH = "apps/vulnerable-app/deployment.yaml"
@@ -59,11 +83,17 @@ def get_manifest_from_github(gh_repo) -> tuple[str, str]:
 
 SYSTEM_PROMPT = """Tu es un expert en securite Kubernetes.
 On te donne : (1) un resume de vulnerabilites detectees par Trivy,
-(2) le manifest YAML actuel du workload concerne.
+(2) le manifest YAML actuel du workload concerne,
+(3) OPTIONNEL : l'erreur d'execution d'un correctif precedent (pod en echec).
 Ta mission :
 - Proposer le manifest YAML CORRIGE : mets a jour l'image vers une version
   recente corrigeant les CVE, supprime privileged, fais tourner le conteneur
   en utilisateur non-root, ajoute des requests/limits CPU et memoire raisonnables.
+- IMPERATIF : le correctif doit REELLEMENT DEMARRER. Une image non-root ne peut
+  ni ecrire dans les repertoires systeme (ex. /var/cache/nginx) ni binder un port
+  < 1024. Si tu passes le conteneur en non-root, choisis une image concue pour cela
+  (ex. nginxinc/nginx-unprivileged) et un containerPort > 1024 (ex. 8080).
+  Si une erreur d'execution t'est fournie, corrige-la explicitement.
 - Le YAML doit rester un Deployment valide et minimal (memes noms, memes labels).
 Reponds STRICTEMENT dans ce format :
 EXPLICATION:
@@ -74,13 +104,17 @@ YAML:
 ```"""
 
 
-def ask_ai_for_fix(ai: OpenAI, report_summary: str, current_manifest: str) -> tuple[str, str]:
+def ask_ai_for_fix(ai: OpenAI, report_summary: str, current_manifest: str,
+                   runtime_failure: str | None = None) -> tuple[str, str]:
+    user_content = f"RAPPORT TRIVY:\n{report_summary}\n\nMANIFEST ACTUEL:\n{current_manifest}"
+    if runtime_failure:
+        user_content += ("\n\nERREUR D'EXECUTION DU CORRECTIF PRECEDENT "
+                         f"(a corriger imperativement):\n{runtime_failure}")
     resp = ai.chat.completions.create(
         model=os.environ["OVH_AI_MODEL"],
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content":
-                f"RAPPORT TRIVY:\n{report_summary}\n\nMANIFEST ACTUEL:\n{current_manifest}"},
+            {"role": "user", "content": user_content},
         ],
         temperature=0.2,   # peu de creativite : on veut du YAML fiable
         max_tokens=2000,
@@ -149,8 +183,15 @@ def main():
     print("=== Rapport resume ===\n" + summary)
 
     manifest, sha = get_manifest_from_github(gh_repo)
+
+    # Boucle auto-corrective : si un correctif precedent a casse le workload,
+    # on renvoie l'erreur d'execution a l'IA pour qu'elle la corrige.
+    runtime_failure = get_runtime_failure("demo")
+    if runtime_failure:
+        print("\n=== Echec d'execution detecte (feedback pour l'IA) ===\n" + runtime_failure)
+
     print("\n=== Appel a l'IA (AI Endpoints OVHcloud)... ===")
-    explanation, fixed_yaml = ask_ai_for_fix(ai, summary, manifest)
+    explanation, fixed_yaml = ask_ai_for_fix(ai, summary, manifest, runtime_failure)
     print("\n=== Explication de l'IA ===\n" + explanation)
 
     url = open_pull_request(gh_repo, sha, fixed_yaml, explanation, summary)
